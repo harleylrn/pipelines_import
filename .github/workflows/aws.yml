@@ -411,9 +411,9 @@ jobs:
       https_proxy: "$PROXY"
       http_proxy: "$PROXY"
       no_proxy: docker,.aws.amdocs.cloud,10.88.253.17,10.88.253.17/32
-      HTTPS_PROXY: "$PROXY"
-      HTTP_PROXY: "$PROXY"
-      NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.17,10.88.253.17/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.17,10.88.253.17/32
       DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE/amdocs-$CLOUD_VENDOR-ansible-ee"
     steps:
     - uses: actions/checkout@v4.1.0
