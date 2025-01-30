@@ -1,0 +1,623 @@
+name: gitechccoe/pipelines/aws
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  check-mr-approvals:
+    runs-on:
+      # - self-hosted
+      # - docker
+      - ubuntu-latest
+    container:
+      image: laptevss/gitlab-api-util
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.event_name }} == 'merge_request_event' || ${{ github.event.pull_request.base.ref }} == "main" || ${{ github.event.pull_request.base.ref }} == "dev"
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - run: echo "APPROVAL_AUTHORS '${APPROVAL_AUTHORS}'"
+    - run: echo "CI_MERGE_REQUEST_TARGET_BRANCH_NAME '${{ github.event.pull_request.base.ref }}'"
+    - run: |
+        echo ""
+        MR_INFO=$(curl --cacert ${CI_SERVER_TLS_CA_FILE} --silent --request GET --header "PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI" \
+        ${{ github.api_url }}/projects/${{ github.repository }}/merge_requests | jq -c ".[] \
+        | select(.sha == \"${{ github.sha }}\" and .state == \"opened\" and .target_branch == \"${{ github.event.pull_request.base.ref }}\")")
+    - run: |
+        echo ""
+        MR_ID=$(echo $MR_INFO | jq '.iid')
+    - run: |
+        echo ""
+        APPROVALS=$(curl --cacert ${CI_SERVER_TLS_CA_FILE} --silent --request GET --header "PRIVATE-TOKEN: ${GITLAB_TOKEN_FOR_CI}" \
+        "${{ github.api_url }}/projects/${{ github.repository }}/merge_requests/${MR_ID}/approvals")
+        # echo "Set the auto-merge when pipeline succeds"
+        # curl --cacert ${CI_SERVER_TLS_CA_FILE} --silent --request PUT --header "PRIVATE-TOKEN: ${GITLAB_TOKEN_FOR_CI}" \
+        # "${{ github.api_url }}/projects/${{ github.repository }}/merge_requests/${MR_ID}/merge" --data '{ "merge_when_pipeline_succeeds": true }'    # - echo "${APPROVALS}"
+    - run: |
+        echo ""
+        APPROVAL_AUTHORS_ARRAY=(${APPROVAL_AUTHORS//,/ })
+        APPROVED=false
+        for AUTHOR in "${APPROVAL_AUTHORS_ARRAY[@]}"; do
+          if echo "${APPROVALS}" | jq -e ".approved_by[] | select(.user.username == \"${AUTHOR}\")" > /dev/null; then
+            APPROVED=true
+            break
+          fi
+        done
+    - run: |
+        echo ""
+        if [ "${APPROVED}" = true ]; then
+          echo "Great job! Your merge request has been approved!";
+        else
+          echo "Almost there! Please get approval from one of the following users: ${APPROVAL_AUTHORS//,/, } to proceed.";
+          exit 1;
+        fi
+  create-collection:
+    needs: check-mr-approvals
+    runs-on:
+      # - self-hosted
+      # - docker
+      - ubuntu-latest
+    container:
+      image: python:3.11
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.event_name }} != 'merge_request_event'
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - run: pip install ansible==9.3.0 ansible-core==2.16.4 --proxy $PROXY
+    - run: |
+        if [ ${{ github.ref }} == 'main' ]
+        then
+          DEFAULT_BRANCH='main'
+        else
+          DEFAULT_BRANCH='dev'
+        fi
+        if [ ${{ github.event_name }} == 'pipeline' -a ! -z $PLAYBOOKS_BRANCH ]
+        then
+          echo "Getting the playbooks branch form pipeline and it is $PLAYBOOKS_BRANCH"
+          BRANCH=$PLAYBOOKS_BRANCH
+        else
+          BRANCH=${dev:-${DEFAULT_BRANCH}}
+        fi
+        echo "Getting the playbooks branch is $BRANCH"
+        git config --global http.sslVerify false
+        git clone https://gitlab-ci-token:${{ github.token }}@${{ github.server_url }}/gitechccoe/ansible/playbooks/aws/playbooks.git --branch ${BRANCH} --single-branch
+        rm -rf playbooks/.git
+        echo "Finished playbooks export"
+    - run: |
+        mkdir roles
+        echo "Check if roles exists"
+        if [ -f roles.txt ]
+        then
+          echo "Getting the roles"
+          cd roles
+          cat ../roles.txt | while read line
+          do
+            if [ "X"$line != "X" ]
+            then
+              if [[ $line =~ .*:.* ]]
+              then
+                role=$(echo $line | cut -d: -f1)
+                mybranch=$(echo $line | cut -d: -f2)
+              else
+                role=$line
+              fi
+              if [ ${{ github.event_name }} == 'pipeline' -a "X"$role == "X"$ROLE_NAME ]
+              then
+                echo "Role name is $ROLE_NAME and in the pipeline call branch is $ROLE_BRANCH"
+                mybranch=${ROLE_BRANCH}
+              fi
+              branch=${mybranch:-main}
+              echo "branch is ${branch}"
+              git clone https://gitlab-ci-token:${{ github.token }}@${{ github.server_url }}/gitechccoe/ansible/roles/${role}.git --branch ${branch} --single-branch
+              rm -rf ${role}/.git*
+              unset mybranch
+            fi
+          done
+          cd ..
+        fi
+        echo "Finished roles export"
+    - run: |
+        echo "Getting the collection modules"
+        if [ ${{ github.event_name }} == 'pipeline' -a ! -z $PLUGINS_BRANCH ]
+        then
+          echo "Getting the plugins branch from pipeline and it is $PLUGINS_BRANCH"
+          BRANCH=$PLUGINS_BRANCH
+        else
+          BRANCH=${dev:-${DEFAULT_BRANCH}}
+        fi
+        git clone https://gitlab-ci-token:${{ github.token }}@${{ github.server_url }}/gitechccoe/ansible/plugins.git --branch ${BRANCH} --single-branch
+        rm -rf plugins/.git
+        echo "Finished the modules export"
+    - run: |
+        echo "Cleanup"
+        rm -f .gitlab-ci.yml roles.txt .ansible-lint modules.txt
+        echo "Cleanup Complete"
+    - run: |
+        echo "Creating the collection"
+        ansible-galaxy collection build
+        echo "Complete."
+    - uses: actions/upload-artifact@v4.1.0
+      if: success()
+      with:
+        name: "${{ github.job }}"
+        retention-days: 7
+        path: "./*.tar.gz"
+  upload-collection:
+    needs: create-collection
+    runs-on:
+      - self-hosted
+      - docker
+    container:
+      image: registry.gitlab.com/gitlab-org/release-cli:latest
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.event_name }} != 'merge_request_event'
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - run: apk --no-cache add openssl ca-certificates curl jq coreutils
+    - run: "echo \"git branch -a --contains ${{ github.sha }}\"\ngit branch -a --contains ${{ github.sha }}\nif [ -z \"${{ github.ref }}\" ]\nthen\n  if [ -z \"$(git branch -a --contains ${{ github.sha }} | grep remotes)\" ]\n  then\n    echo \"Can't find the branch for the git output\"\n    echo \"Using the GitLab API to get it\"\n    curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" ${{ github.api_url }}/projects/${{ github.repository }}/repository/commits/${{ github.sha }}/refs \n    BRANCH=$(curl --silent --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" ${{ github.api_url }}/projects/${{ github.repository }}/repository/commits/${{ github.sha }}/refs | jq -r \".[] | select(.type == \\\"branch\\\") | .name\")\n  else\n    echo \"Getting the brnach from the git output\"\n    BRANCH=$(git branch -a --contains ${{ github.sha }} | grep remotes | xargs basename)\n  fi\nelse\n  BRANCH=${{ github.ref }}\nfi\n"
+    - run: "echo \"Finding the collection name\" \nFILE_NAME=$(find . -type f -name '*.tar.gz' | head -n 1 | xargs basename)\necho $FILE_NAME\nNAMESPACE=$(echo \"$FILE_NAME\" | awk -F'-' '{print $1}')\nNAME=$(echo \"$FILE_NAME\" | awk -F'-' '{print $2}')\nVERSION=$(echo \"$FILE_NAME\" | awk -F'-' '{for (i=3; i<NF; i++) printf $i\"-\"; print $(NF)}' | sed 's/.tar.gz$//')\necho \"git branch -a --contains ${{ github.sha }}\"\ngit branch -a --contains ${{ github.sha }}\n"
+    - run: |
+        echo "Uploading the collection"
+        curl --header "JOB-TOKEN: ${{ github.token }}" --cacert "${CI_SERVER_TLS_CA_FILE}" --upload-file ${FILE_NAME} \
+        ${{ github.api_url }}/projects/${{ github.repository }}/packages/generic/${NAMESPACE}-${NAME}/${VERSION}-${BRANCH}/${FILE_NAME}
+    - run: |
+        echo "Saving the name of the colleciton for the future use"
+        echo "COLLECTION_URL=${{ github.api_url }}/projects/${{ github.repository }}/packages/generic/${NAMESPACE}-${NAME}/${VERSION}-${BRANCH}/${FILE_NAME}" > collection_url.env
+#     # 'artifacts.dotenv' was not transformed because there is no suitable equivalent in GitHub Actions
+  build-image-configs:
+    needs: create-collection
+    runs-on:
+      - self-hosted
+      - docker
+    container:
+      image: docker:24.0.2-dind
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.event_name }} != 'merge_request_event'
+    services:
+      docker:24.0.2-dind:
+        image: docker:24.0.2-dind
+        options: "--entrypoint dockerd-entrypoint.sh docker:24.0.2-dind --insecure-registry nexus.aws.amdocs.cloud:5443"
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_DRIVER: overlay2
+      DOCKER_TLS_CERTDIR: ''
+      https_proxy: "$PROXY"
+      http_proxy: "$PROXY"
+      no_proxy: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32
+      NEXUS_URL: nexus.aws.amdocs.cloud:5443
+      NEXUS_USER: docker
+      NEXUS_PASSWORD: docker
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - run: apk add --no-cache python3 python3-dev py3-pip gcc git curl build-base autoconf automake py3-cryptography linux-headers musl-dev libffi-dev openssl-dev wget
+    - run: python3 -m pip install ansible==9.3.0 ansible-core==2.16.4 ansible-builder
+    - run: mkdir -p /etc/docker/certs.d/${NEXUS_URL}
+    - run: openssl s_client -showcerts -connect ${NEXUS_URL} < /dev/null | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > /etc/docker/certs.d/${NEXUS_URL}/ca.crt
+    - run: |
+        mkdir /root/.docker
+        BASE64_STRING=$(echo -n ${NEXUS_USER}:${NEXUS_PASSWORD} | base64)
+        cat >> /root/.docker/config.json << EOF
+        {
+          "auths": {
+              "$NEXUS_URL": {
+                    "auth": "${BASE64_STRING}"
+                  },
+              "registry.redhat.io": {
+                "auth": "bWljaGFlbC5vcmxvdjpnaGpjbmo1NQ=="
+                  }
+              }
+        }
+        EOF
+    - run: |
+        echo "Creating required directories"
+        mkdir context
+    - run: "echo \"Finding the collection name\" \nFILE_NAME=$(find . -type f -name '*.tar.gz' | head -n 1 | xargs basename)\necho $FILE_NAME\n"
+    - run: |
+        echo "Create the required files"
+        cat >> ansible.cfg << EOF
+        [galaxy]
+        server_list = galaxy_release, automation_hub
+        [galaxy_server.galaxy_release]
+        url=https://galaxy.ansible.com
+        [galaxy_server.automation_hub]
+        url=https://console.redhat.com/api/automation-hub/content/1640491-synclist/
+        auth_url=https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+        token=eyJhbGciOiJIUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJhZDUyMjdhMy1iY2ZkLTRjZjAtYTdiNi0zOTk4MzVhMDg1NjYifQ.eyJpYXQiOjE2NjA4NTAyNDUsImp0aSI6IjUxZWE4N2MzLWU4NzItNGE2NS05NjA2LTE2YTlmYmFhMzY3NCIsImlzcyI6Imh0dHBzOi8vc3NvLnJlZGhhdC5jb20vYXV0aC9yZWFsbXMvcmVkaGF0LWV4dGVybmFsIiwiYXVkIjoiaHR0cHM6Ly9zc28ucmVkaGF0LmNvbS9hdXRoL3JlYWxtcy9yZWRoYXQtZXh0ZXJuYWwiLCJzdWIiOiJmOjUyOGQ3NmZmLWY3MDgtNDNlZC04Y2Q1LWZlMTZmNGZlMGNlNjptaWNoYWVsLm9ybG92IiwidHlwIjoiT2ZmbGluZSIsImF6cCI6ImNsb3VkLXNlcnZpY2VzIiwibm9uY2UiOiI4MzgyYTQ4MS0zZDgwLTRhMTAtODUwMy0zNTIxZjhhOWMxZjIiLCJzZXNzaW9uX3N0YXRlIjoiZDgzODg2NTktNDVhNy00N2FjLWJlMWItOTY1YjM5ZWYzNzBkIiwic2NvcGUiOiJvcGVuaWQgYXBpLmlhbS5zZXJ2aWNlX2FjY291bnRzIG9mZmxpbmVfYWNjZXNzIiwic2lkIjoiZDgzODg2NTktNDVhNy00N2FjLWJlMWItOTY1YjM5ZWYzNzBkIn0.wO2wIWcTYh2ti-0jb6665UnuTRgMlJF059zc9FzplJM
+        EOF
+        cat >> requirements.yml << EOF
+        ---
+        collections:
+          - community.general
+          - ansible.utils
+          - amazon.aws
+          - community.aws
+          - name: community.docker
+            version: 3.8.0
+          - containers.podman
+          - awx.awx
+          - freeipa.ansible_freeipa
+          - community.crypto
+        EOF
+        cat >> requirements.txt << EOF
+        urllib3
+        jmespath
+        dnspython
+        EOF
+        cat >> bindep.txt << EOF
+        yum-utils
+        EOF
+        cat >> gitconfig << EOF
+        [http]
+          sslVerify = false
+        [safe]
+          directory = /terraform/vars
+        EOF
+        cat >> dnf.conf << EOF
+        [main]
+        gpgcheck=1
+        installonly_limit=3
+        clean_requirements_on_remove=True
+        best=True
+        http_caching=packages
+        http_caching=packages
+        proxy=${PROXY}
+        EOF
+        cat >> environment << EOF
+        https_proxy=$PROXY
+        http_proxy=$PROXY
+        no_proxy=docker,.aws.amdocs.cloud
+        HTTPS_PROXY=$PROXY
+        HTTP_PROXY=$PROXY
+        NO_PROXY=docker,.aws.amdocs.cloud
+        EOF
+        cat >> execution-environment.yml << EOF
+        ---
+        version: 3
+        build_arg_defaults:
+          ANSIBLE_GALAXY_CLI_COLLECTION_OPTS: '-c'
+        dependencies:
+          galaxy: requirements.yml
+          python: requirements.txt
+          system: bindep.txt
+          ansible_core:
+            package_pip: ansible-core==2.16.4
+          ansible_runner:
+            package_pip: ansible-runner
+          python_interpreter:
+            package_system: "python3.11"
+            python_path: "/usr/bin/python3.11"
+        options:
+          package_manager_path: /usr/bin/microdnf
+          user: root
+        images:
+          base_image:
+            name: registry.redhat.io/ansible-automation-platform-21/ee-minimal-rhel8:latest
+        additional_build_files:
+          - src: ansible.cfg
+            dest: configs
+          - src: ${FILE_NAME}
+            dest: configs
+          - src: gitconfig
+            dest: configs
+          - src: dnf.conf
+            dest: configs
+          - src: environment
+            dest: configs
+        additional_build_steps:
+          prepend_base: |
+            ADD _build/configs/ansible.cfg /etc/ansible/ansible.cfg
+            ADD _build/configs/gitconfig /etc/gitconfig
+            ADD _build/configs/dnf.conf /etc/dnf/dnf.conf
+            ADD _build/configs/environment /etc/environment
+            COPY _build/configs/${FILE_NAME} /tmp
+          prepend_final: |
+            COPY modules /terraform/modules
+            RUN /usr/bin/microdnf -y install yum-utils
+            RUN yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+            RUN /usr/bin/microdnf -y install terraform-1.5.0-1.x86_64 git
+            RUN yum-config-manager --disable hashicorp
+          append_final: |
+            RUN HTTPS_PROXY=${PROXY} ANSIBLE_GALAXY_DISABLE_GPG_VERIFY=1 ansible-galaxy collection install $ANSIBLE_GALAXY_CLI_COLLECTION_OPTS /tmp/${FILE_NAME} -p "/usr/share/ansible/collections" -f && \
+              rm -f /tmp/${FILE_NAME}
+            RUN chmod -R 755 /usr/share/crypto-policies && \
+                mkdir -p /terraform/{vars,jinja} && \
+                rm -f /etc/ansible/ansible.cfg /etc/environment && \
+                touch /etc/ansible/ansible.cfg /etc/environment && \
+                sed '/^proxy.*/d' -i /etc/dnf/dnf.conf
+        EOF
+    - run: |
+        echo "Cloning the terraform modules in place"
+        git config --global http.sslVerify false
+        echo "Check if modules exists"
+        if [ -f modules.txt ]
+        then
+          cd context
+          echo "Getting the modules"
+          mkdir modules
+          cd modules
+          cat ../../modules.txt | while read line
+          do
+            if [ "X"$line != "X" ]
+            then
+              if [[ $line =~ .*:.* ]]
+              then
+                module=$(echo $line | cut -d: -f1)
+                mybranch=$(echo $line | cut -d: -f2)
+              else
+                module=$line
+              fi
+              if [ ${{ github.event_name }} == 'pipeline' -a "X"$module == "X"$MODULE_NAME ]
+              then
+                echo "MODULE name is $MODULE_NAME and in the pipeline call branch is $MODULE_BRANCH"
+                mybranch=${MODULE_BRANCH}
+              fi
+              branch=${mybranch:-main}
+              echo "branch is ${branch}"
+              echo "Clone module ${module}"
+              git clone https://gitlab-ci-token:${{ github.token }}@${{ github.server_url }}/gitechccoe/terraform/aws/${module}.git --branch ${branch} --single-branch
+              rm -rf ${module}/.git*
+            fi
+          done
+          cd ../..
+        else
+          echo "Creating the modules directory"
+          mkdir context/modules
+        fi
+        echo "Finished modules export"
+    - run: |
+        echo "Run the build"
+        export HTTPS_PROXY=$PROXY
+        export HTTP_PROXY=$PROXY
+        export NO_PROXY=docker,.aws.amdocs.cloud
+        ansible-builder create --output-filename Dockerfile
+    - run: |
+        echo "Update the Dockerfile"
+        sed "/^FROM.*/a ARG HTTPS_PROXY=$PROXY\nARG HTTP_PROXY=$PROXY\nARG NO_PROXY=docker,.aws.amdocs.cloud\nARG https_proxy=$PROXY\nARG http_proxy=$PROXY\nARG no_proxy=docker,.aws.amdocs.cloud" -i context/Dockerfile
+    - uses: actions/upload-artifact@v4.1.0
+      if: success()
+      with:
+        name: "${{ github.job }}"
+        retention-days: 7
+        path: context/
+  build-local-image:
+    needs: build-image-configs
+    runs-on:
+      - self-hosted
+      - docker
+    container:
+      image: docker:24.0.2-dind
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.event_name }} != 'merge_request_event'
+    services:
+      docker:24.0.2-dind:
+        image: docker:24.0.2-dind
+        options: "--entrypoint dockerd-entrypoint.sh docker:24.0.2-dind --insecure-registry gitccoe.aws.amdocs.cloud:5050"
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_DRIVER: overlay2
+      DOCKER_TLS_CERTDIR: ''
+      https_proxy: "$PROXY"
+      http_proxy: "$PROXY"
+      no_proxy: docker,.aws.amdocs.cloud,10.88.253.17,10.88.253.17/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.17,10.88.253.17/32
+      DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE/amdocs-$CLOUD_VENDOR-ansible-ee"
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - run: apk add --no-cache python3 python3-dev py3-pip gcc git curl build-base autoconf automake py3-cryptography linux-headers musl-dev libffi-dev openssl openssl-dev wget jq
+    - run: mkdir -p /etc/docker/certs.d/${CI_REGISTRY}
+    - run: openssl s_client -showcerts -connect ${CI_REGISTRY} < /dev/null | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > /etc/docker/certs.d/${CI_REGISTRY}/ca.crt
+    - run: "if [ -z \"${{ github.ref }}\" ]\nthen\n  if [ -z \"$(git branch -a --contains ${{ github.sha }} | grep remotes)\" ]\n  then\n    echo \"Can't find the branch for the git output\"\n    echo \"Using the GitLab API to get it\"\n    curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" ${{ github.api_url }}/projects/${{ github.repository }}/repository/commits/${{ github.sha }}/refs \n    BRANCH=$(curl --silent --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" ${{ github.api_url }}/projects/${{ github.repository }}/repository/commits/${{ github.sha }}/refs | jq -r \".[] | select(.type == \\\"branch\\\") | .name\")\n  else\n    echo \"Getting the brnach from the git output\"\n    BRANCH=$(git branch -a --contains ${{ github.sha }} | grep remotes | xargs basename)\n  fi\nelse\n  BRANCH=${{ github.ref }}\nfi\nmkdir /root/.docker\nBASE64_STRING=$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\ncat >> /root/.docker/config.json << EOF\n{\n  \"auths\": {\n      \"${CI_REGISTRY}\": {\n            \"auth\": \"${BASE64_STRING}\"\n          },\n      \"registry.redhat.io\": {\n        \"auth\": \"bWljaGFlbC5vcmxvdjpnaGpjbmo1NQ==\"\n          }\n      }\n}\nEOF\n"
+    - run: docker login $CI_REGISTRY
+    - run: |
+        export HTTPS_PROXY=$PROXY
+        export HTTP_PROXY=$PROXY
+        export NO_PROXY=docker,.aws.amdocs.cloud
+        DATE=$(date +%Y%m%d-%H%M%S)
+        echo $BRANCH
+        DOCKER_IMAGE_NAME=${DOCKER_IMAGE_NAME}:${BRANCH}
+        echo $DOCKER_IMAGE_NAME
+    - run: docker build --pull -t "$DOCKER_IMAGE_NAME-$DATE" context
+    - run: docker push "$DOCKER_IMAGE_NAME-$DATE"
+    - run: echo "DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME-$DATE" > image.env
+    - run: |
+        docker tag "$DOCKER_IMAGE_NAME-$DATE" "$DOCKER_IMAGE_NAME-latest"
+        docker push "$DOCKER_IMAGE_NAME-latest"
+#     # 'artifacts.dotenv' was not transformed because there is no suitable equivalent in GitHub Actions
+  upload-collection-nexus:
+    needs:
+    - create-collection
+    - upload-collection
+    - build-image-configs
+    - build-local-image
+    runs-on:
+      - self-hosted
+      - docker
+    container:
+      image: curlimages/curl:latest
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || (always() && ${{ github.ref }}) || !(${{ github.event_name }} == 'merge_request_event' || ${{ github.event_name }} == 'pipeline')
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+      https_proxy: "$PROXY"
+      http_proxy: "$PROXY"
+      no_proxy: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32,10.88.253.17,10.88.253.17/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32,10.88.253.17,10.88.253.17/32
+      NEXUS_URL: nexus.aws.amdocs.cloud
+      NEXUS_USER: docker
+      NEXUS_PASSWORD: docker
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: actions/download-artifact@v4.1.0
+    - run: "echo \"Finding the collection name\" \nFILE_NAME=$(echo $COLLECTION_URL | awk -F'/' '{print $NF}')\nVERSION=$(echo $COLLECTION_URL | awk -F'/' '{print $(NF-1)}')\n"
+    - run: |
+        echo "Upload the collection to Nexus"
+        curl -kvu ${NEXUS_USER}:${NEXUS_PASSWORD} --upload-file ${FILE_NAME} https://${NEXUS_URL}/repository/ansible_collection/${VERSION}/${FILE_NAME}
+        echo "COLLECTION_URL=https://${NEXUS_URL}/repository/ansible_collection/${VERSION}/${FILE_NAME}" > collection.env
+#     # 'artifacts.dotenv' was not transformed because there is no suitable equivalent in GitHub Actions
+  upload-image-nexus:
+    needs:
+    - create-collection
+    - upload-collection
+    - build-image-configs
+    - build-local-image
+    runs-on:
+      - self-hosted
+      - docker
+    container:
+      image: docker:24.0.2-dind
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || (always() && ${{ github.ref }}) || !(${{ github.event_name }} == 'merge_request_event' || ${{ github.event_name }} == 'pipeline')
+    services:
+      docker:24.0.2-dind:
+        image: docker:24.0.2-dind
+        options: "--entrypoint dockerd-entrypoint.sh docker:24.0.2-dind --insecure-registry nexus.aws.amdocs.cloud:5443 --insecure-registry gitccoe.aws.amdocs.cloud:5050"
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_DRIVER: overlay2
+      DOCKER_TLS_CERTDIR: ''
+      https_proxy: "$PROXY"
+      http_proxy: "$PROXY"
+      no_proxy: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32,10.88.253.17,10.88.253.17/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32,10.88.253.17,10.88.253.17/32
+      NEXUS_URL: nexus.aws.amdocs.cloud:5443
+      NEXUS_USER: docker
+      NEXUS_PASSWORD: docker
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: actions/download-artifact@v4.1.0
+    - run: apk add --no-cache python3 python3-dev py3-pip gcc git curl build-base autoconf automake py3-cryptography linux-headers musl-dev libffi-dev openssl-dev wget
+    - run: mkdir -p /etc/docker/certs.d/${NEXUS_URL}
+    - run: openssl s_client -showcerts -connect ${NEXUS_URL} < /dev/null | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > /etc/docker/certs.d/${NEXUS_URL}/ca.crt
+    - run: mkdir -p /etc/docker/certs.d/${CI_REGISTRY}
+    - run: openssl s_client -showcerts -connect ${CI_REGISTRY} < /dev/null | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > /etc/docker/certs.d/${CI_REGISTRY}/ca.crt
+    - run: |
+        mkdir /root/.docker
+        BASE64_STRING=$(echo -n ${NEXUS_USER}:${NEXUS_PASSWORD} | base64)
+        BASE64_CI_STRING=$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)
+        cat >> /root/.docker/config.json << EOF
+        {
+          "auths": {
+              "$NEXUS_URL": {
+                    "auth": "${BASE64_STRING}"
+                  },
+              "${CI_REGISTRY}": {
+                    "auth": "${BASE64_CI_STRING}"
+                  },
+              "registry.redhat.io": {
+                "auth": "bWljaGFlbC5vcmxvdjpnaGpjbmo1NQ=="
+                  }
+              }
+        }
+        EOF
+    - run: docker login $CI_REGISTRY
+    - run: docker login $NEXUS_URL
+    - run: |
+        echo "Manipulating the image names"
+        NEXUS_IMAGE_NAME=$(echo $DOCKER_IMAGE_NAME | sed -e "s|${CI_REGISTRY_IMAGE}|${NEXUS_URL}|")
+        LATEST=$(echo $NEXUS_IMAGE_NAME | sed -E 's/(:.*)+-[0-9]{8}-[0-9]{6}/\1/')-latest
+        echo "Docker image name is $DOCKER_IMAGE_NAME"
+        echo "Nexus image name is $NEXUS_IMAGE_NAME"
+        echo "Latest image name is $LATEST"
+    - run: docker pull "${DOCKER_IMAGE_NAME}"
+    - run: |
+        echo "Tagging the images ${NEXUS_IMAGE_NAME} and ${LATEST}"
+        docker tag "${DOCKER_IMAGE_NAME}" "${NEXUS_IMAGE_NAME}"
+        docker tag "${NEXUS_IMAGE_NAME}" "${LATEST}"
+    - run: |
+        echo "Pushing the images ${NEXUS_IMAGE_NAME} and ${LATEST}"
+        docker push "${NEXUS_IMAGE_NAME}"
+        docker push "${LATEST}"
+        echo "NEXUS_IMAGE_NAME=${NEXUS_IMAGE_NAME}" > image.env
+        echo "LATEST=${LATEST}" >> image.env
+#     # 'artifacts.dotenv' was not transformed because there is no suitable equivalent in GitHub Actions
+  create-release:
+    needs:
+    - upload-collection-nexus
+    - upload-image-nexus
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.com/gitlab-org/release-cli:latest
+    if: # Unable to map conditional expression to GitHub Actions equivalent
+#         ${{ github.event_name }} == "pipeline" || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event' || always() || ${{ github.ref }} && ${{ github.event_name }} != 'merge_request_event'
+    env:
+      CLOUD_VENDOR: aws
+      PIPELINE_LOCAL_NAME: Pipeline on $CI_COMMIT_TITLE
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: actions/download-artifact@v4.1.0
+    - run: apk --no-cache add openssl ca-certificates curl jq coreutils
+    - run: mkdir -p /usr/local/share/ca-certificates/extra
+    - run: openssl s_client -connect ${{ github.server_url }}:${CI_SERVER_PORT} -servername ${{ github.server_url }} -showcerts </dev/null 2>/dev/null | sed -e '/-----BEGIN/,/-----END/!d' | tee "/usr/local/share/ca-certificates/${{ github.server_url }}.crt" >/dev/null
+    - run: update-ca-certificates
+    - run: |
+        createWIKI(){
+          module=$1
+          branch=$2
+          fsx=${3:-""}
+          vendor=${4:-$CLOUD_VENDOR}
+          if [ ! -z $fsx ]
+          then
+            fsx_add="%2F${fsx}"
+            fsx_string="${fsx}%2F"
+            fsx_slug="/${fsx}"
+          else
+            fsx_add=""
+            fsx_string=""
+            fsx_slug=""
+          fi
+          NOT_FOUND='{"message":"404 File Not Found"}'
+          echo "Creating the wiki page for module $module"
+          echo "Prepare the documentation for module ${module} branch ${branch}"
+          if [ ! -z $fsx ]
+          then
+            echo "Prepare the documentation for module ${module} branch ${branch} and fsx ${fsx}"
+          fi
+          # Check is file README.md exists in the module
+          RAW_FILE=$(curl --header "PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI" --cacert "${CI_SERVER_TLS_CA_FILE}" --silent "${{ github.api_url }}/projects/${PROJ_ID}/repository/files/${fsx_string}README%2Emd/raw?ref=${branch}")
+          if [ "X$RAW_FILE" != "X$NOT_FOUND" ]
+          then
+            echo "Found example vars file for the module ${module}"
+            echo "Checking if this files exists in Wiki"
+            WIKI_FILE=$(curl --header  "PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI" --cacert "${CI_SERVER_TLS_CA_FILE}" --silent "${{ github.api_url }}/projects/150/wikis" | jq ".[] | select(.slug == \"home/${vendor}/${module}${fsx_slug}\") | .slug | @uri")
+            if [ "X$WIKI_FILE" == "X" ]
+            then
+              echo "Creating the wiki page for the module ${module}"
+              curl --header  "PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI" --cacert "${CI_SERVER_TLS_CA_FILE}" --silent "${{ github.api_url }}/projects/150/wikis" --data "title=home%2F${vendor}/${module}${fsx_add}&content=${RAW_FILE}"
+            else
+              echo "Updating the wiki page for the module ${module}"
+              WIKI_FILE=$(echo $WIKI_FILE | sed 's/\"//g')
+              curl --request PUT --header  "PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI" --cacert "${CI_SERVER_TLS_CA_FILE}" --silent "${{ github.api_url }}/projects/150/wikis/${WIKI_FILE}" --data "title=home%2F${vendor}/${module}${fsx_add}&content=${RAW_FILE}"
+            fi
+            echo "Adding the $module to the $vendor page"
+            echo "- [${module}${fsx_add}](home%2F$vendor/${module}${fsx_add})  " >> $vendor.md
+          fi
+        }
+    - run: "updateWikiPage() {\n  VENDOR=${1:-$CLOUD_VENDOR}\n  echo \"Updating the $VENDOR page in the wiki\"\n  WIKI_NOT_FOUND='{\"message\":\"404 Wiki Page Not Found\"}'\n  STATUS_WIKI=$(curl --request PUT --header  \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/150/wikis/home%2F${VENDOR}\" --data \"title=home%2F${VENDOR}&content=$(cat ${VENDOR}.md)\")\n  if [ \"X$STATUS_WIKI\" == \"X$WIKI_NOT_FOUND\" ]\n  then\n    echo \"The $VENDOR page doesn't exist, creating instead\"\n    curl --request POST --header  \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/150/wikis\" --data \"title=home%2F${VENDOR}&content=$(cat ${VENDOR}.md)\"\n  fi      \n}\n"
+    - run: "echo \"Creating the release notes\"\necho \"Release ${{ github.ref }} of components in ${{ github.repository }}\" > notes.md\necho \"Get latest tag\"\nLATEST_TAG=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/tags\" | jq \"[.[] | select( .name | contains(\\\"${{ github.ref }}\\\") | not ) | {name: .name }] | sort_by(.name) | last | .name\" | sed 's/\\\"//g')\n# If LATEST_TAG is empty, then it is the first commit in the repository\necho \"LATEST_TAG is $LATEST_TAG\"\nif [ \"X$LATEST_TAG\" == \"Xnull\" ]; then\n  echo \"Getting the date from the commit\"\n  for i in $(seq 1 100)\n  do\n    LATEST_TAG=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/commits?all=true&per_page=100&page=${i}\" | jq '.[] | select((.parent_ids| length) == 0) | .short_id')\n    if [ ! -z $LATEST_TAG ]\n    then\n      LATEST_TAG=$(echo $LATEST_TAG | sed 's/\\\"//g')\n      break\n    fi\n  done\n  PREV_DATE=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/commits/${LATEST_TAG}\" | jq '.created_at')\nelse\n  echo \"Getting the date from the tag\"\n  PREV_DATE=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/tags/${LATEST_TAG}\" | jq '.created_at')\n  if [ X\"$PREV_DATE\" == \"Xnull\" ]\n  then\n    echo \"The created_date of the tag was empty, getting the created_date of the commit\"\n    PREV_DATE=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/tags/${LATEST_TAG}\" | jq '.commit.created_at')\n  fi\nfi\nPREV_DATE=$(echo $PREV_DATE | sed 's/\\\"//g')\necho \"PREV_DATE is $PREV_DATE\"\ncurl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${{ github.repository }}/repository/compare?from=${LATEST_TAG}&to=${{ github.ref }}\" > output.json\nif [ ! -s output.json ]\nthen\n  echo \"Adding the project commits\"\n  echo \"### Project ${{ github.repository }}\" >> notes.md\n  echo \"| ID | Title | Author |\" >> notes.md\n  echo \"|--|:--|:--|\" >> notes.md\n  jq -r '(.commits[] | select(.title | test(\"(feat|fix|chore|docs|style|refactor|perf|test).*:\")) | [.short_id, .title, .author_name]) | @json' < output.json | while read line ; do echo $line | sed 's/,/|/g'| sed 's/\\[/|/'| sed 's/\"//g' | sed 's/\\]/|/'; done >> notes.md\nelse\n  echo \"### No changes in Project ${{ github.repository }}\" >> notes.md\nfi\nif [ -f modules.txt ]\nthen\n  if [ ! -s modules.md ]\n  then\n    echo \"### Terraform Modules Changes\" > modules.md\n    echo \"| Module | Change Title | Author |\" >> modules.md\n    echo \"|--|:--|:--|\" >> modules.md\n  fi\n  echo \"List of the default configurations per module:  \" > $CLOUD_VENDOR.md\n  cat modules.txt | while read line\n  do\n    if [ \"X\"$line != \"X\" ]\n    then\n      if [[ $line =~ .*:.* ]]\n      then\n        module=$(echo $line | cut -d: -f1)\n        mybranch=$(echo $line | cut -d: -f2)\n      else\n        module=$line\n      fi\n      branch=${mybranch:-main}\n      echo \"branch is ${branch}\"\n      echo \"Finding the project for module ${module}\"\n      PROJ_ID=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects?search=${module}\"  | jq \".[] | select(.name == \\\"${module}\\\") | select(.namespace.full_path == \\\"gitechccoe/terraform/${CLOUD_VENDOR}\\\") | .id\")\n      echo \"Get the commits\"\n      curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${PROJ_ID}/repository/commits?ref_name=${branch}&per_page=1000&since=${PREV_DATE}\" | jq -r \"(.[] | select(.title | test(\\\"(feat|fix|chore|docs|style|refactor|perf|test).*:\\\")) | [\\\"${module}\\\", .title, .author_name]) | @json\" > output.json\n      if [ -s output.json ]\n      then\n        echo \"Adding the module commits\"\n        cat output.json | while read myline ; do echo $myline | sed 's/,/|/g'| sed 's/\\[/|/'| sed 's/\"//g' | sed 's/\\]/|/'; done >> modules.md\n      fi\n      echo \"Prepare the documentation for module ${module} branch ${branch}\"\n      # Chek is file README.md exists in the module\n      if [ ${module} == 'fsx' ]\n      then\n        for fsx in fsx-lustre-create fsx-ontap-create fsx-openzfs-create fsx-openzfs-restore fsx-windowsfileserver-create\n        do \n          createWIKI $module $branch ${fsx}\n        done\n      else\n        createWIKI $module $branch\n      fi\n    fi\n  done\n  updateWikiPage $CLOUD_VENDOR\n  LINES_IN_FILE=$(wc -l modules.md | awk '{print $1}')\n  if [ $LINES_IN_FILE -gt 3 ]\n  then\n    echo \"Adding the module commits to the notes\"\n    cat modules.md >> notes.md\n  else\n    echo \"### No changes in Terraform Modules\" >> notes.md\n  fi\n  rm -f modules.md\nfi\nif [ -f roles.txt ]\nthen\n  if [ ! -s roles.md ]\n  then\n    echo \"### Ansible Roles Changes\" > roles.md\n    echo \"| Role | Change Title | Author |\" >> roles.md\n    echo \"|--|:--|:--|\" >> roles.md\n  fi\n  cat roles.txt | while read line\n  do\n    if [ \"X\"$line != \"X\" ]\n    then\n      if [[ $line =~ .*:.* ]]\n      then\n        role=$(echo $line | cut -d: -f1)\n        mybranch=$(echo $line | cut -d: -f2)\n      else\n        role=$line\n      fi\n      branch=${mybranch:-main}\n      echo \"branch is ${branch}\"\n      echo \"Finding the project for role ${role}\"\n      PROJ_ID=$(curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects?search=${role}\"  | jq \".[] | select(.name == \\\"${role}\\\") | select(.namespace.full_path == \\\"gitechccoe/ansible/roles\\\") | .id\")\n      echo \"Get the commits\"\n      curl --header \"PRIVATE-TOKEN: $GITLAB_TOKEN_FOR_CI\" --cacert \"${CI_SERVER_TLS_CA_FILE}\" --silent \"${{ github.api_url }}/projects/${PROJ_ID}/repository/commits?ref_name=${branch}&per_page=1000&since=${PREV_DATE}\" | jq -r \"(.[] | select(.title | test(\\\"(feat|fix|chore|docs|style|refactor|perf|test).*:\\\")) | [\\\"${role}\\\", .title, .author_name]) | @json\" > output.json\n      if [ -s output.json ]\n      then\n        echo \"Adding the role commits\"\n        cat output.json | while read myline ; do echo $myline | sed 's/,/|/g'| sed 's/\\[/|/'| sed 's/\"//g' | sed 's/\\]/|/'; done >> roles.md\n      fi\n    fi\n    createWIKI $role $branch \"\" \"Ansible\"\n  done\n  updateWikiPage \"Ansible\"\n  LINES_IN_FILE=$(wc -l roles.md | awk '{print $1}')\n  if [ $LINES_IN_FILE -gt 3 ]\n  then\n    echo \"Adding the role commits to the notes\"\n    cat roles.md >> notes.md\n  else\n    echo \"### No changes in Ansible Roles\" >> notes.md\n  fi\n  rm -f roles.md\nfi\n"
+    - uses: softprops/action-gh-release@v0.1.15
+      with:
+        tag_name: "${{ github.ref }}"
+        body: notes.md
