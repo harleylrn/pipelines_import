@@ -5,7 +5,7 @@ on:
 jobs:
   check-mr-approvals:
     runs-on:
-      - self-hosted
+      # - self-hosted
       # - docker
       - ubuntu-latest
     container:
@@ -55,7 +55,7 @@ jobs:
   create-collection:
     needs: check-mr-approvals
     runs-on:
-      - self-hosted
+      # - self-hosted
       # - docker
       - ubuntu-latest
     container:
