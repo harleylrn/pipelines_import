@@ -191,9 +191,9 @@ jobs:
       https_proxy: "$PROXY"
       http_proxy: "$PROXY"
       no_proxy: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32
-      HTTPS_PROXY: "$PROXY"
-      HTTP_PROXY: "$PROXY"
-      NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32
+      # HTTPS_PROXY: "$PROXY"
+      # HTTP_PROXY: "$PROXY"
+      # NO_PROXY: docker,.aws.amdocs.cloud,10.88.253.28,10.88.253.28/32
       NEXUS_URL: nexus.aws.amdocs.cloud:5443
       NEXUS_USER: docker
       NEXUS_PASSWORD: docker
